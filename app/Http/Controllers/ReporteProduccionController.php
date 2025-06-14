@@ -9,9 +9,24 @@ use App\Models\Lote;
 use Illuminate\Http\Request;
 use Carbon\Carbon;
 use App\Http\Requests\ReporteProduccion\StoreReporteProduccionRequest;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
 
 class ReporteProduccionController extends Controller
 {
+    /**
+     * Constructor to apply policies to resource methods.
+     */
+    public function __construct()
+    {
+        // Reports are usually read-only or generated, not fully CRUD.
+        // We'll allow index, create, store, show.
+        $this->authorizeResource(ReporteProduccion::class, 'reporte_produccion', [
+            'except' => ['edit', 'update', 'destroy'] // No edit, update, delete for reports
+        ]);
+    }
+
     public function index()
     {
         $reportes = ReporteProduccion::with('generadoPor')->paginate(10);
@@ -20,36 +35,42 @@ class ReporteProduccionController extends Controller
 
     public function create()
     {
-        $users = User::all();
-        $ordenesProduccion = OrdenProduccion::all(); // Para reportes por orden
+        $users = User::whereHas('role', function ($query) {
+            $query->whereIn('nombre_rol', ['administrador', 'produccion']);
+        })->get();
+        $ordenesProduccion = OrdenProduccion::all(); // For reports by order
         return view('reportes_produccion.create', compact('users', 'ordenesProduccion'));
     }
 
     public function store(StoreReporteProduccionRequest $request)
     {
-        // Seeder: ReporteProduccion::create([
-        //     'fecha_generacion' => Carbon::now(),
-        //     'tipo_reporte' => 'Orden de Producción',
-        //     'parametros_generacion' => json_encode(['orden_id' => $ordenProduccionCompletada->id]),
-        //     'ruta_archivo_generado' => 'reports/produccion/orden_' . $ordenProduccionCompletada->id . '_' . Carbon::now()->format('Ymd_His') . '.pdf',
-        //     'generado_por_user_id' => $jefeProduccionUser->id,
-        //     'estado' => 'generado',
-        //     'observaciones' => 'Reporte detallado de la Orden de Producción #' . $ordenProduccionCompletada->id,
-        // ]);
+        try {
+            DB::beginTransaction();
 
-        // Lógica para generar el contenido real del reporte
-        $contenido = $this->generateReportContent($request->tipo_reporte, $request->parametros_generacion);
-        $rutaArchivo = $this->saveReportToFile($request->tipo_reporte, $contenido);
+            // Logic to generate the actual report content
+            // Pass only validated parameters to the private method
+            $contenido = $this->generateReportContent($request->tipo_reporte, $request->parametros_generacion ?? []);
+            // Nota: saveReportToFile es un placeholder. Si realmente generas archivos,
+            // asegúrate de que la lógica sea robusta y guarde en un lugar seguro.
+            // Y que la ruta sea accesible públicamente si vas a vincularla.
+            $rutaArchivo = $this->saveReportToFile($request->tipo_reporte, $contenido);
 
-        ReporteProduccion::create([
-            'fecha_reporte' => Carbon::now(), // O la fecha seleccionada para el reporte
-            'tipo_reporte' => $request->tipo_reporte,
-            'contenido_reporte' => json_encode($contenido), // Guarda el contenido como JSON
-            'generado_por_user_id' => Auth::id(),
-            'observaciones' => $request->observaciones,
-        ]);
+            ReporteProduccion::create([
+                'fecha_reporte' => Carbon::now(), // O la fecha seleccionada para el reporte
+                'tipo_reporte' => $request->tipo_reporte,
+                'contenido_reporte' => json_encode($contenido), // Store content as JSON
+                'generado_por_user_id' => Auth::id(), // Assign logged-in user
+                'observaciones' => $request->observaciones,
+                // 'ruta_archivo_generado' => $rutaArchivo, // Uncomment if you implement actual file saving
+            ]);
 
-        return redirect()->route('reportes-produccion.index')->with('success', 'Reporte generado y guardado exitosamente.');
+            DB::commit();
+            return redirect()->route('reportes-produccion.index')->with('success', 'Reporte generado y guardado exitosamente.');
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error("Error al generar y guardar reporte de producción: " . $e->getMessage(), ['exception' => $e, 'request' => $request->all()]);
+            return back()->withInput()->with('error', 'Error al generar el reporte: ' . $e->getMessage());
+        }
     }
 
     public function show(ReporteProduccion $reporteProduccion)
@@ -58,34 +79,39 @@ class ReporteProduccionController extends Controller
         return view('reportes_produccion.show', compact('reporteProduccion'));
     }
 
-    // Métodos auxiliares para la generación de reportes
+    // Auxiliary methods for report generation
     private function generateReportContent(string $tipoReporte, array $parametros)
     {
         switch ($tipoReporte) {
             case 'diario':
-                // Lógica para generar reporte diario
-                // Ej: total de producción, lotes aprobados/rechazados del día
                 $fecha = Carbon::parse($parametros['fecha'] ?? Carbon::now()->toDateString());
                 $lotesDelDia = Lote::whereDate('fecha_produccion', $fecha)->get();
                 return ['fecha' => $fecha->toDateString(), 'lotes' => $lotesDelDia->toArray()];
             case 'lote':
-                // Lógica para reporte por lote específico
+                // Ensure lote_id is present and valid
+                if (!isset($parametros['lote_id'])) {
+                    return ['mensaje' => 'Parámetro lote_id es requerido para reporte por lote.'];
+                }
                 $lote = Lote::with('ordenProduccion.productoTerminado', 'controlesCalidad')->find($parametros['lote_id']);
-                return $lote ? $lote->toArray() : [];
-                // ... otros tipos de reportes
+                return $lote ? $lote->toArray() : ['mensaje' => 'Lote no encontrado.'];
+                // ... other report types
             default:
                 return ['mensaje' => 'Tipo de reporte no reconocido o no implementado.'];
         }
     }
 
-    // Podrías tener un método para guardar el reporte como PDF/Excel y retornar la ruta
+    // You could have a method to save the report as PDF/Excel and return the path
     private function saveReportToFile(string $tipoReporte, array $contenido)
     {
-        // Implementar lógica para generar un archivo PDF/Excel y guardarlo
-        // Ej: usar paquetes como Dompdf, Laravel Excel (Maatwebsite/Laravel-Excel)
-        // Por ahora, solo un placeholder
-        $filename = "report_{$tipoReporte}_" . Carbon::now()->format('Ymd_His') . ".json"; // O .pdf/.xlsx
+        // Implement logic to generate a PDF/Excel file and save it
+        // E.g., use packages like Dompdf, Laravel Excel (Maatwebsite/Laravel-Excel)
+        // For now, just a placeholder path (not actually saving a file).
+        // If you implement this, ensure the 'storage/app/reports' directory is writable
+        // and consider using Laravel's Storage facade.
+        $filename = "report_{$tipoReporte}_" . Carbon::now()->format('Ymd_His') . ".json"; // Or .pdf/.xlsx
         // file_put_contents(storage_path('app/reports/' . $filename), json_encode($contenido, JSON_PRETTY_PRINT));
-        return 'storage/reports/' . $filename; // Ruta pública si es accesible
+        return 'storage/reports/' . $filename; // Public path if accessible
     }
+
+    // No edit, update, delete methods as reports are usually historical records generated by the system.
 }

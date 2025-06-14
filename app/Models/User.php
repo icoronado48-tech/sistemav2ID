@@ -109,4 +109,42 @@ class User extends Authenticatable
     {
         return $this->hasMany(ReporteProduccion::class, 'generado_por_user_id');
     }
+
+    /**
+     * Check if the user has a given role by its name.
+     * This method eager loads the 'role' relationship if it's not already loaded,
+     * to avoid N+1 query issues when checking roles repeatedly.
+     *
+     * @param string $roleName The name of the role (e.g., 'administrador', 'produccion').
+     * @return bool True if the user has the specified role, false otherwise.
+     */
+    public function hasRole(string $roleName): bool
+    {
+        // Check if the 'role' relationship is loaded. If not, load it.
+        // This helps prevent N+1 query problems when checking roles frequently.
+        if (!$this->relationLoaded('role')) {
+            $this->load('role');
+        }
+
+        // Return true if the user's role exists and its name matches the given roleName.
+        return $this->role && $this->role->nombre_rol === $roleName;
+    }
+
+    /**
+     * Check if the user has any of the given roles by their names.
+     * This method eager loads the 'role' relationship if it's not already loaded.
+     *
+     * @param array<string> $roleNames An array of role names (e.g., ['produccion', 'inventario']).
+     * @return bool True if the user has any of the specified roles, false otherwise.
+     */
+    public function hasAnyRole(array $roleNames): bool
+    {
+        // Check if the 'role' relationship is loaded. If not, load it.
+        if (!$this->relationLoaded('role')) {
+            $this->load('role');
+        }
+
+        // Return true if the user's role exists and its name is in the given array of roleNames.
+        return $this->role && in_array($this->role->nombre_rol, $roleNames);
+    }
 }

@@ -3,12 +3,27 @@
 namespace App\Http\Controllers;
 
 use App\Models\Lote;
-use App\Models\ControlCalidad; // Para crear el registro de control de calidad
+use App\Models\ControlCalidad;
 use Illuminate\Http\Request;
-use App\Http\Requests\Lote\UpdateLoteQualityRequest; // Crear
+use App\Http\Requests\Lote\UpdateLoteQualityRequest;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
+use Carbon\Carbon;
 
 class LoteController extends Controller
 {
+    /**
+     * Constructor to apply policies to resource methods.
+     */
+    public function __construct()
+    {
+        $this->authorizeResource(Lote::class, 'lote', [
+            'except' => ['create', 'store', 'edit', 'update', 'destroy']
+        ]);
+        $this->middleware('can:updateQualityStatus,lote')->only('updateQualityStatus');
+    }
+
     public function index()
     {
         $lotes = Lote::with('ordenProduccion', 'productoTerminado', 'registradoPor')->paginate(10);
@@ -21,36 +36,36 @@ class LoteController extends Controller
         return view('lotes.show', compact('lote'));
     }
 
-    // No hay `create`, `store`, `edit`, `update`, `destroy` CRUD estándar para Lote,
-    // ya que se generan principalmente a través de OrdenProduccion y su estado.
-    // Solo un método para actualizar estado de calidad
-
+    /**
+     * Update the quality status of the specified lot.
+     */
     public function updateQualityStatus(UpdateLoteQualityRequest $request, Lote $lote)
     {
-        // El seeder de ControlCalidad hace:
-        // ControlCalidad::create([
-        //     'lote_id' => $lote->id,
-        //     'fecha_control' => Carbon::now(),
-        //     'observaciones' => 'Textura y sabor conformes. Apariencia ligeramente irregular.',
-        //     'resultado' => 'aprobado',
-        //     'supervisado_por_user_id' => $supervisorCalidadUser->id,
-        // ]);
+        // La autorización es manejada por el middleware 'can:updateQualityStatus,lote'.
+        try {
+            DB::beginTransaction(); // Iniciar una transacción de base de datos
 
-        // Lógica de actualización
-        $lote->update([
-            'estado_calidad' => $request->estado_calidad,
-            'observaciones_calidad' => $request->observaciones_calidad,
-        ]);
+            // Lógica de actualización del lote
+            $lote->update([
+                'estado_calidad' => $request->estado_calidad,
+                'observaciones_calidad' => $request->observaciones_calidad,
+            ]);
 
-        // Opcional: Crear un registro en la tabla `control_calidad`
-        ControlCalidad::create([
-            'lote_id' => $lote->id,
-            'supervisado_por_user_id' => auth()->id(), // El usuario logueado que realiza el control
-            'fecha_control' => now(),
-            'resultado' => $request->estado_calidad,
-            'observaciones' => $request->observaciones_calidad,
-        ]);
+            // Crear un registro en la tabla `control_calidad` para la auditoría de calidad.
+            ControlCalidad::create([
+                'lote_id' => $lote->id,
+                'supervisado_por_user_id' => Auth::id(), // El usuario logueado que realiza el control
+                'fecha_control' => Carbon::now(),
+                'resultado' => $request->estado_calidad,
+                'observaciones' => $request->observaciones_calidad,
+            ]);
 
-        return redirect()->route('lotes.show', $lote)->with('success', 'Estado de calidad del lote actualizado.');
+            DB::commit(); // Confirmar la transacción si todo es exitoso
+            return redirect()->route('lotes.show', $lote)->with('success', 'Estado de calidad del lote actualizado exitosamente.');
+        } catch (\Exception $e) {
+            DB::rollBack(); // Revertir la transacción en caso de cualquier error
+            Log::error("Error al actualizar estado de calidad del lote: " . $e->getMessage(), ['exception' => $e, 'lote_id' => $lote->id, 'request' => $request->all()]); // Registrar el error
+            return back()->withInput()->with('error', 'Hubo un error al actualizar el estado de calidad. Por favor, inténtelo de nuevo.');
+        }
     }
 }

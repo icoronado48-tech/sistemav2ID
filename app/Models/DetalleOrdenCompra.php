@@ -17,12 +17,25 @@ class DetalleOrdenCompra extends Model
         'materia_prima_id',
         'cantidad',
         'precio_unitario',
+        // 'subtotal', // ¡ELIMINADO! Ya no es una columna de la base de datos.
     ];
 
     protected $casts = [
         'cantidad' => 'decimal:2',
         'precio_unitario' => 'decimal:2',
+        // 'subtotal' => 'decimal:2', // ¡ELIMINADO! Ya no es una columna de la base de datos.
     ];
+
+    /**
+     * Get the subtotal for this purchase order detail.
+     * This is an Accessor that calculates the subtotal dynamically.
+     *
+     * @return float
+     */
+    public function getSubtotalAttribute(): float
+    {
+        return $this->cantidad * $this->precio_unitario;
+    }
 
     /**
      * Get the purchase order that owns the detail.

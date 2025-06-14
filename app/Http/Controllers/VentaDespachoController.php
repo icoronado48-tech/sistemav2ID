@@ -7,14 +7,25 @@ use App\Models\Cliente;
 use App\Models\User;
 use App\Models\Lote;
 use App\Models\ProductoTerminado;
+use App\Models\DetalleVentaDespacho; // Required for managing details
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth; // For Auth::id()
 use App\Http\Requests\VentaDespacho\StoreVentaDespachoRequest;
 use App\Http\Requests\VentaDespacho\UpdateVentaDespachoRequest;
-use App\Http\Requests\VentaDespacho\AddDetalleVentaDespachoRequest; // Crear
+// AddDetalleVentaDespachoRequest is no longer needed as a separate Form Request for dedicated methods
 
 class VentaDespachoController extends Controller
 {
+    /**
+     * Constructor to apply policies to resource methods.
+     */
+    public function __construct()
+    {
+        $this->authorizeResource(VentaDespacho::class, 'venta_despacho');
+    }
+
     public function index()
     {
         $ventas = VentaDespacho::with('cliente', 'registradoPor')->paginate(10);
@@ -24,7 +35,9 @@ class VentaDespachoController extends Controller
     public function create()
     {
         $clientes = Cliente::all();
-        $users = User::all(); // O usuarios de ventas
+        $users = User::whereHas('role', function ($query) {
+            $query->whereIn('nombre_rol', ['administrador', 'ventas']);
+        })->get();
         $lotesAprobados = Lote::where('estado_calidad', 'Aprobado')
             ->whereHas('productoTerminado', function ($query) {
                 $query->where('stock_actual', '>', 0);
@@ -35,25 +48,52 @@ class VentaDespachoController extends Controller
 
     public function store(StoreVentaDespachoRequest $request)
     {
-        // Seeder: VentaDespacho::create([
-        //     'cliente_id' => $clienteSupermercado->id,
-        //     'fecha_venta_despacho' => Carbon::now(),
-        //     'tipo_documento' => 'Factura',
-        //     'numero_documento' => 'FAC-20250609-001',
-        //     'total_monto' => 1500.00,
-        //     'estado_despacho' => 'Pendiente',
-        //     'registrado_por_user_id' => $userVentas->id,
-        //     'observaciones' => 'Factura de venta a supermercado.',
-        // ]);
-
-        DB::beginTransaction();
         try {
-            $venta = VentaDespacho::create($request->validated());
+            DB::beginTransaction();
+            $venta = VentaDespacho::create(array_merge($request->validated(), [
+                'registrado_por_user_id' => Auth::id(), // Assign logged-in user
+                'total_monto' => 0, // Initialize to 0, will be summed from details
+            ]));
+
+            // Handle details for the new sale
+            if ($request->has('detalles') && is_array($request->detalles)) {
+                foreach ($request->detalles as $detalleData) {
+                    if (!isset($detalleData['lote_id']) || !isset($detalleData['cantidad_vendida_despachada']) || !isset($detalleData['precio_unitario'])) {
+                        DB::rollBack();
+                        return back()->withInput()->with('error', 'Formato de detalle de venta inválido.');
+                    }
+
+                    $lote = Lote::find($detalleData['lote_id']);
+                    if (!$lote) {
+                        DB::rollBack();
+                        return back()->withInput()->with('error', "Lote con ID {$detalleData['lote_id']} no existe.");
+                    }
+                    if ($lote->estado_calidad !== 'Aprobado') {
+                        DB::rollBack();
+                        return back()->withInput()->with('error', 'Solo se pueden vender productos de lotes con estado de calidad "Aprobado".');
+                    }
+                    if ($lote->productoTerminado->stock_actual < $detalleData['cantidad_vendida_despachada']) {
+                        DB::rollBack();
+                        return back()->withInput()->with('error', "Stock insuficiente del producto del lote {$lote->id}. Solo tienes {$lote->productoTerminado->stock_actual} disponibles.");
+                    }
+
+                    $subtotal = $detalleData['cantidad_vendida_despachada'] * $detalleData['precio_unitario'];
+                    $venta->detallesVenta()->create(array_merge($detalleData, ['subtotal' => $subtotal]));
+
+                    // Decrement stock of Finished Product
+                    $lote->productoTerminado->decrement('stock_actual', $detalleData['cantidad_vendida_despachada']);
+                    // Optional: Register an inventory adjustment for sales
+                    // AjusteInventario::create([...]);
+                }
+            }
+            // Update total_monto after all details are added
+            $venta->update(['total_monto' => $venta->detallesVenta()->sum('subtotal')]);
 
             DB::commit();
             return redirect()->route('ventas-despachos.index')->with('success', 'Venta/Despacho creado exitosamente.');
         } catch (\Exception $e) {
             DB::rollBack();
+            Log::error("Error al crear la venta/despacho: " . $e->getMessage(), ['exception' => $e, 'request' => $request->all()]);
             return back()->withInput()->with('error', 'Error al crear la venta/despacho: ' . $e->getMessage());
         }
     }
@@ -67,136 +107,118 @@ class VentaDespachoController extends Controller
     public function edit(VentaDespacho $ventaDespacho)
     {
         $clientes = Cliente::all();
-        $users = User::all();
-        $lotesAprobados = Lote::where('estado_calidad', 'Aprobado')->get();
-        $ventaDespacho->load('detallesVenta.lote');
+        $users = User::whereHas('role', function ($query) {
+            $query->whereIn('nombre_rol', ['administrador', 'ventas']);
+        })->get();
+        $lotesAprobados = Lote::where('estado_calidad', 'Aprobado')
+            ->whereHas('productoTerminado', function ($query) {
+                $query->where('stock_actual', '>', 0);
+            })
+            ->get();
+        $ventaDespacho->load('detallesVenta.lote.productoTerminado'); // Load existing details
         return view('ventas_despachos.edit', compact('ventaDespacho', 'clientes', 'users', 'lotesAprobados'));
     }
 
     public function update(UpdateVentaDespachoRequest $request, VentaDespacho $ventaDespacho)
     {
-        $ventaDespacho->update($request->validated());
-        return redirect()->route('ventas-despachos.index')->with('success', 'Venta/Despacho actualizado exitosamente.');
+        try {
+            DB::beginTransaction();
+            $ventaDespacho->update($request->validated());
+
+            // Synchronize details
+            $currentDetailIds = [];
+            if ($request->has('detalles') && is_array($request->detalles)) {
+                foreach ($request->detalles as $detalleData) {
+                    if (!isset($detalleData['lote_id']) || !isset($detalleData['cantidad_vendida_despachada']) || !isset($detalleData['precio_unitario'])) {
+                        DB::rollBack();
+                        return back()->withInput()->with('error', 'Formato de detalle de venta inválido.');
+                    }
+
+                    $lote = Lote::find($detalleData['lote_id']);
+                    if (!$lote) {
+                        DB::rollBack();
+                        return back()->withInput()->with('error', "Lote con ID {$detalleData['lote_id']} no existe.");
+                    }
+
+                    $subtotal = $detalleData['cantidad_vendida_despachada'] * $detalleData['precio_unitario'];
+
+                    $detalleExistente = $ventaDespacho->detallesVenta()->where('lote_id', $detalleData['lote_id'])->first();
+
+                    $oldCantidad = $detalleExistente ? $detalleExistente->cantidad_vendida_despachada : 0;
+                    $newCantidad = $detalleData['cantidad_vendida_despachada'];
+
+                    // Revert stock of old quantity, then deduct new quantity
+                    // This part should be transactional and careful.
+                    // First, return the old quantity to stock if it was already deducted.
+                    if ($oldCantidad > 0 && $lote->productoTerminado) {
+                        $lote->productoTerminado->increment('stock_actual', $oldCantidad);
+                    }
+                    // Then, check if new quantity can be deducted and deduct it.
+                    if ($lote->productoTerminado && $lote->productoTerminado->stock_actual < $newCantidad) {
+                        DB::rollBack();
+                        // If the new quantity is too high, revert the increment as well (to prevent double increment if transaction rolls back later)
+                        if ($oldCantidad > 0) {
+                            $lote->productoTerminado->decrement('stock_actual', $oldCantidad);
+                        }
+                        return back()->withInput()->with('error', "Stock insuficiente para la nueva cantidad del lote {$lote->id}. Solo tienes {$lote->productoTerminado->stock_actual} disponibles.");
+                    }
+                    if ($lote->productoTerminado) { // Check again before decrementing
+                        $lote->productoTerminado->decrement('stock_actual', $newCantidad);
+                    }
+
+
+                    $detalle = $ventaDespacho->detallesVenta()->updateOrCreate(
+                        ['lote_id' => $detalleData['lote_id']], // Condition to find
+                        ['cantidad_vendida_despachada' => $newCantidad, 'precio_unitario' => $detalleData['precio_unitario'], 'subtotal' => $subtotal]
+                    );
+                    $currentDetailIds[] = $detalle->id;
+                }
+            }
+            // Delete details that are no longer in the request and revert their stock
+            $detailsToDelete = $ventaDespacho->detallesVenta()->whereNotIn('id', $currentDetailIds)->get();
+            foreach ($detailsToDelete as $detalle) {
+                $lote = $detalle->lote;
+                if ($lote && $lote->productoTerminado) { // Check if related models exist
+                    $lote->productoTerminado->increment('stock_actual', $detalle->cantidad_vendida_despachada);
+                }
+                $detalle->delete();
+            }
+
+            // Update total_monto after synchronization
+            $ventaDespacho->update(['total_monto' => $ventaDespacho->detallesVenta()->sum('subtotal')]);
+
+            DB::commit();
+            return redirect()->route('ventas-despachos.index')->with('success', 'Venta/Despacho actualizado exitosamente.');
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error("Error al actualizar la venta/despacho: " . $e->getMessage(), ['exception' => $e, 'venta_id' => $ventaDespacho->id, 'request' => $request->all()]);
+            return back()->withInput()->with('error', 'Error al actualizar la venta/despacho: ' . $e->getMessage());
+        }
     }
 
     public function destroy(VentaDespacho $ventaDespacho)
     {
-        // Si se elimina una venta, el stock de PT de los lotes debe ser revertido
-        DB::beginTransaction();
         try {
+            DB::beginTransaction();
+            // Revert stock for all associated details before deleting the sale
             foreach ($ventaDespacho->detallesVenta as $detalle) {
                 $lote = $detalle->lote;
-                if ($lote) {
+                if ($lote && $lote->productoTerminado) { // Check if related models exist
                     $lote->productoTerminado->increment('stock_actual', $detalle->cantidad_vendida_despachada);
-                    // Opcional: Registrar un ajuste de inventario de entrada
+                    // Optional: Register an inventory adjustment for sales return
+                    // AjusteInventario::create([...]);
                 }
             }
-            $ventaDespacho->delete();
+            $ventaDespacho->delete(); // This should cascade delete DetalleVentaDespacho if configured
             DB::commit();
             return redirect()->route('ventas-despachos.index')->with('success', 'Venta/Despacho eliminado y stock revertido.');
+        } catch (\Illuminate\Database\QueryException $e) {
+            Log::error("Error al eliminar venta/despacho por FK: " . $e->getMessage(), ['exception' => $e, 'venta_id' => $ventaDespacho->id]);
+            return back()->with('error', 'No se puede eliminar la venta/despacho. Verifique si aún tiene registros dependientes inesperados.');
         } catch (\Exception $e) {
             DB::rollBack();
+            Log::error("Error general al eliminar venta/despacho: " . $e->getMessage(), ['exception' => $e, 'venta_id' => $ventaDespacho->id]);
             return back()->with('error', 'Error al eliminar la venta/despacho: ' . $e->getMessage());
-        }
-    }
-
-    // Método para añadir detalles de venta/despacho (productos y lotes)
-    public function addDetalle(AddDetalleVentaDespachoRequest $request, VentaDespacho $ventaDespacho)
-    {
-        DB::beginTransaction();
-        try {
-            $lote = Lote::findOrFail($request->lote_id);
-
-            if ($lote->estado_calidad !== 'Aprobado') {
-                DB::rollBack();
-                return back()->withInput()->with('error', 'Solo se pueden vender productos de lotes con estado de calidad "Aprobado".');
-            }
-            if ($lote->productoTerminado->stock_actual < $request->cantidad_vendida_despachada) {
-                DB::rollBack();
-                return back()->withInput()->with('error', "Stock insuficiente del producto del lote {$lote->id}. Solo tienes {$lote->productoTerminado->stock_actual}.");
-            }
-
-            $subtotal = $request->cantidad_vendida_despachada * $request->precio_unitario_venta;
-
-            $ventaDespacho->detallesVenta()->create(array_merge($request->validated(), ['subtotal' => $subtotal]));
-
-            // Decrementar stock de Producto Terminado
-            $lote->productoTerminado->decrement('stock_actual', $request->cantidad_vendida_despachada);
-            // Opcional: Registrar un ajuste de inventario de salida
-
-            // Actualizar el total_monto de la venta
-            $ventaDespacho->update(['total_monto' => $ventaDespacho->detallesVenta->sum('subtotal')]);
-
-            DB::commit();
-            return back()->with('success', 'Detalle de venta/despacho añadido y stock actualizado.');
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return back()->withInput()->with('error', 'Error al añadir detalle de venta: ' . $e->getMessage());
-        }
-    }
-
-    public function updateDetalle(Request $request, VentaDespacho $ventaDespacho, $detalleId)
-    {
-        DB::beginTransaction();
-        try {
-            $detalle = $ventaDespacho->detallesVenta()->findOrFail($detalleId);
-            $lote = $detalle->lote;
-            $oldCantidad = $detalle->cantidad_vendida_despachada;
-
-            $request->validate([
-                'cantidad_vendida_despachada' => 'required|numeric|min:0.01',
-                'precio_unitario_venta' => 'required|numeric|min:0.01',
-            ]);
-
-            $newCantidad = $request->cantidad_vendida_despachada;
-
-            // Revertir stock antiguo y aplicar nuevo
-            $lote->productoTerminado->increment('stock_actual', $oldCantidad);
-            if ($lote->productoTerminado->stock_actual < $newCantidad) {
-                DB::rollBack();
-                $lote->productoTerminado->decrement('stock_actual', $oldCantidad); // Revertir incremento
-                return back()->withInput()->with('error', "Stock insuficiente para la nueva cantidad. Solo tienes {$lote->productoTerminado->stock_actual} disponibles.");
-            }
-            $lote->productoTerminado->decrement('stock_actual', $newCantidad);
-
-            $subtotal = $newCantidad * $request->precio_unitario_venta;
-            $detalle->update([
-                'cantidad_vendida_despachada' => $newCantidad,
-                'precio_unitario_venta' => $request->precio_unitario_venta,
-                'subtotal' => $subtotal,
-            ]);
-
-            $ventaDespacho->update(['total_monto' => $ventaDespacho->detallesVenta->sum('subtotal')]);
-
-            DB::commit();
-            return back()->with('success', 'Detalle de venta/despacho actualizado.');
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return back()->withInput()->with('error', 'Error al actualizar detalle de venta: ' . $e->getMessage());
-        }
-    }
-
-    public function removeDetalle(VentaDespacho $ventaDespacho, $detalleId)
-    {
-        DB::beginTransaction();
-        try {
-            $detalle = $ventaDespacho->detallesVenta()->findOrFail($detalleId);
-            $lote = $detalle->lote;
-            $cantidadRevertida = $detalle->cantidad_vendida_despachada;
-
-            $detalle->delete();
-
-            // Revertir el stock del producto terminado
-            $lote->productoTerminado->increment('stock_actual', $cantidadRevertida);
-
-            // Actualizar el total_monto de la venta
-            $ventaDespacho->update(['total_monto' => $ventaDespacho->detallesVenta->sum('subtotal')]);
-
-            DB::commit();
-            return back()->with('success', 'Detalle de venta/despacho eliminado y stock revertido.');
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return back()->with('error', 'Error al eliminar detalle de venta: ' . $e->getMessage());
         }
     }
 }
